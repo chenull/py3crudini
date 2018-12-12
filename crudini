@@ -1,0 +1,2246 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# vim:fileencoding=utf8
+#
+# Copyright © Pádraig Brady <P@draigBrady.com>
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GPLv2, the GNU General Public License version 2, as
+# published by the Free Software Foundation. http://gnu.org/licenses/gpl.html
+
+import atexit
+import contextlib
+import errno
+import getopt
+import hashlib
+from io import StringIO
+import os
+import pipes
+import re
+import shutil
+import string
+import sys
+import tempfile
+
+from configparser import (
+    DuplicateSectionError, NoSectionError, NoOptionError,
+    InterpolationMissingOptionError, InterpolationDepthError,
+    InterpolationSyntaxError, MissingSectionHeaderError, ParsingError,
+    DEFAULTSECT, MAX_INTERPOLATION_DEPTH
+)
+
+
+def error(message=None):
+    if message:
+        sys.stderr.write(message + '\n')
+
+
+def delete_if_exists(path):
+    """Delete a file, but ignore file not found error.
+    """
+    try:
+        os.unlink(path)
+    except EnvironmentError as e:
+        if e.errno != errno.ENOENT:
+            print(str(e))
+            raise
+
+
+class RawConfigParser(object):
+    def __init__(self, defaults=None, dict_type=dict):
+        if dict_type != dict:
+            raise ValueError('Custom dict types not supported')
+        self.data = INIConfig(defaults=defaults, optionxformsource=self)
+
+    def optionxform(self, optionstr):
+        return optionstr.lower()
+
+    def defaults(self):
+        d = {}
+        secobj = self.data._defaults
+        for name in secobj._options:
+            d[name] = secobj._compat_get(name)
+        return d
+
+    def sections(self):
+        """Return a list of section names, excluding [DEFAULT]"""
+        return list(self.data)
+
+    def add_section(self, section):
+        """Create a new section in the configuration.
+
+        Raise DuplicateSectionError if a section by the specified name
+        already exists.  Raise ValueError if name is DEFAULT or any of
+        its case-insensitive variants.
+        """
+        # The default section is the only one that gets the case-insensitive
+        # treatment - so it is special-cased here.
+        if section.lower() == "default":
+            raise ValueError('Invalid section name: %s' % section)
+
+        if self.has_section(section):
+            raise DuplicateSectionError(section)
+        else:
+            self.data._new_namespace(section)
+
+    def has_section(self, section):
+        """Indicate whether the named section is present in the configuration.
+
+        The DEFAULT section is not acknowledged.
+        """
+        return (section in self.data)
+
+    def options(self, section):
+        """Return a list of option names for the given section name."""
+        if section in self.data:
+            return list(self.data[section])
+        else:
+            raise NoSectionError(section)
+
+    def read(self, filenames):
+        """Read and parse a filename or a list of filenames.
+
+        Files that cannot be opened are silently ignored; this is
+        designed so that you can specify a list of potential
+        configuration file locations (e.g. current directory, user's
+        home directory, systemwide directory), and all existing
+        configuration files in the list will be read.  A single
+        filename may also be given.
+        """
+        files_read = []
+        if isinstance(filenames, str):
+            filenames = [filenames]
+        for filename in filenames:
+            try:
+                fp = open(filename)
+            except IOError:
+                continue
+            files_read.append(filename)
+            self.data._readfp(fp)
+            fp.close()
+        return files_read
+
+    def readfp(self, fp, filename=None):
+        """Like read() but the argument must be a file-like object.
+
+        The `fp' argument must have a `readline' method.  Optional
+        second argument is the `filename', which if not given, is
+        taken from fp.name.  If fp has no `name' attribute, `<???>' is
+        used.
+        """
+        self.data._readfp(fp)
+
+    def get(self, section, option, vars=None):
+        if not self.has_section(section):
+            raise NoSectionError(section)
+        if vars is not None and option in vars:
+            value = vars[option]
+
+        sec = self.data[section]
+        if option in sec:
+            return sec._compat_get(option)
+        else:
+            raise NoOptionError(option, section)
+
+    def items(self, section):
+        if section in self.data:
+            ans = []
+            for opt in self.data[section]:
+                ans.append((opt, self.get(section, opt)))
+            return ans
+        else:
+            raise NoSectionError(section)
+
+    def getint(self, section, option):
+        return int(self.get(section, option))
+
+    def getfloat(self, section, option):
+        return float(self.get(section, option))
+
+    _boolean_states = {'1': True, 'yes': True, 'true': True, 'on': True,
+                       '0': False, 'no': False, 'false': False, 'off': False}
+
+    def getboolean(self, section, option):
+        v = self.get(section, option)
+        if v.lower() not in self._boolean_states:
+            raise ValueError('Not a boolean: %s' % v)
+        return self._boolean_states[v.lower()]
+
+    def has_option(self, section, option):
+        """Check for the existence of a given option in a given section."""
+        if section in self.data:
+            sec = self.data[section]
+        else:
+            raise NoSectionError(section)
+        return (option in sec)
+
+    def set(self, section, option, value):
+        """Set an option."""
+        if section in self.data:
+            self.data[section][option] = value
+        else:
+            raise NoSectionError(section)
+
+    def write(self, fp):
+        """Write an .ini-format representation of the configuration state."""
+        fp.write(str(self.data))
+
+    def remove_option(self, section, option):
+        """Remove an option."""
+        if section in self.data:
+            sec = self.data[section]
+        else:
+            raise NoSectionError(section)
+        if option in sec:
+            del sec[option]
+            return 1
+        else:
+            return 0
+
+    def remove_section(self, section):
+        """Remove a file section."""
+        if not self.has_section(section):
+            return False
+        del self.data[section]
+        return True
+
+
+class ConfigDict(object):
+    """Present a dict interface to a ini section."""
+
+    def __init__(self, cfg, section, vars):
+        self.cfg = cfg
+        self.section = section
+        self.vars = vars
+
+    def __getitem__(self, key):
+        try:
+            return RawConfigParser.get(self.cfg, self.section, key, self.vars)
+        except (NoOptionError, NoSectionError):
+            raise KeyError(key)
+
+
+class ConfigParser(RawConfigParser):
+
+    def get(self, section, option, raw=False, vars=None):
+        """Get an option value for a given section.
+
+        All % interpolations are expanded in the return values, based on the
+        defaults passed into the constructor, unless the optional argument
+        `raw' is true.  Additional substitutions may be provided using the
+        `vars' argument, which must be a dictionary whose contents overrides
+        any pre-existing defaults.
+
+        The section DEFAULT is special.
+        """
+        if section != DEFAULTSECT and not self.has_section(section):
+            raise NoSectionError(section)
+
+        option = self.optionxform(option)
+        value = RawConfigParser.get(self, section, option, vars)
+
+        if raw:
+            return value
+        else:
+            d = ConfigDict(self, section, vars)
+            return self._interpolate(section, option, value, d)
+
+    def _interpolate(self, section, option, rawval, vars):
+        # do the string interpolation
+        value = rawval
+        depth = MAX_INTERPOLATION_DEPTH
+        while depth:                    # Loop through this until it's done
+            depth -= 1
+            if "%(" in value:
+                try:
+                    value = value % vars
+                except KeyError as e:
+                    raise InterpolationMissingOptionError(
+                        option, section, rawval, e.args[0])
+            else:
+                break
+        if value.find("%(") != -1:
+            raise InterpolationDepthError(option, section, rawval)
+        return value
+
+    def items(self, section, raw=False, vars=None):
+        """Return a list of tuples with (name, value) for each option
+        in the section.
+
+        All % interpolations are expanded in the return values, based on the
+        defaults passed into the constructor, unless the optional argument
+        `raw' is true.  Additional substitutions may be provided using the
+        `vars' argument, which must be a dictionary whose contents overrides
+        any pre-existing defaults.
+
+        The section DEFAULT is special.
+        """
+        if section != DEFAULTSECT and not self.has_section(section):
+            raise NoSectionError(section)
+        if vars is None:
+            options = list(self.data[section])
+        else:
+            options = []
+            for x in self.data[section]:
+                if x not in vars:
+                    options.append(x)
+            options.extend(vars.keys())
+
+        if "__name__" in options:
+            options.remove("__name__")
+
+        d = ConfigDict(self, section, vars)
+        if raw:
+            return [(option, d[option])
+                    for option in options]
+        else:
+            return [(option, self._interpolate(section, option, d[option], d))
+                    for option in options]
+
+
+class SafeConfigParser(ConfigParser):
+    _interpvar_re = re.compile(r"%\(([^)]+)\)s")
+    _badpercent_re = re.compile(r"%[^%]|%$")
+
+    def set(self, section, option, value):
+        if not isinstance(value, str):
+            raise TypeError("option values must be strings")
+        # check for bad percent signs:
+        # first, replace all "good" interpolations
+        tmp_value = self._interpvar_re.sub('', value)
+        # then, check if there's a lone percent sign left
+        m = self._badpercent_re.search(tmp_value)
+        if m:
+            raise ValueError("invalid interpolation syntax in %r at "
+                             "position %d" % (value, m.start()))
+
+        ConfigParser.set(self, section, option, value)
+
+    def _interpolate(self, section, option, rawval, vars):
+        # do the string interpolation
+        L = []
+        self._interpolate_some(option, L, rawval, section, vars, 1)
+        return ''.join(L)
+
+    _interpvar_match = re.compile(r"%\(([^)]+)\)s").match
+
+    def _interpolate_some(self, option, accum, rest, section, map, depth):
+        if depth > MAX_INTERPOLATION_DEPTH:
+            raise InterpolationDepthError(option, section, rest)
+        while rest:
+            p = rest.find("%")
+            if p < 0:
+                accum.append(rest)
+                return
+            if p > 0:
+                accum.append(rest[:p])
+                rest = rest[p:]
+            # p is no longer used
+            c = rest[1:2]
+            if c == "%":
+                accum.append("%")
+                rest = rest[2:]
+            elif c == "(":
+                m = self._interpvar_match(rest)
+                if m is None:
+                    raise InterpolationSyntaxError(
+                        option, section,
+                        "bad interpolation variable reference %r" % rest)
+                var = m.group(1)
+                rest = rest[m.end():]
+                try:
+                    v = map[var]
+                except KeyError:
+                    raise InterpolationMissingOptionError(
+                        option, section, rest, var)
+                if "%" in v:
+                    self._interpolate_some(option, accum, v,
+                                           section, map, depth + 1)
+                else:
+                    accum.append(v)
+            else:
+                raise InterpolationSyntaxError(
+                    option, section,
+                    "'%' must be followed by '%' or '(', found: " + repr(rest))
+
+
+class ConfigNamespace(object):
+    """Abstract class representing the interface of Config objects.
+
+    A ConfigNamespace is a collection of names mapped to values, where
+    the values may be nested namespaces.  Values can be accessed via
+    container notation - obj[key] - or via dotted notation - obj.key.
+    Both these access methods are equivalent.
+
+    To minimize name conflicts between namespace keys and class members,
+    the number of class members should be minimized, and the names of
+    all class members should start with an underscore.
+
+    Subclasses must implement the methods for container-like access,
+    and this class will automatically provide dotted access.
+
+    """
+
+    # Methods that must be implemented by subclasses
+
+    def _getitem(self, key):
+        return NotImplementedError(key)
+
+    def __setitem__(self, key, value):
+        raise NotImplementedError(key, value)
+
+    def __delitem__(self, key):
+        raise NotImplementedError(key)
+
+    def __iter__(self):
+        return NotImplementedError()
+
+    def _new_namespace(self, name):
+        raise NotImplementedError(name)
+
+    def __contains__(self, key):
+        try:
+            self._getitem(key)
+        except KeyError:
+            return False
+        return True
+
+    # Machinery for converting dotted access into container access,
+    # and automatically creating new sections/namespaces.
+    #
+    # To distinguish between accesses of class members and namespace
+    # keys, we first call object.__getattribute__().  If that succeeds,
+    # the name is assumed to be a class member.  Otherwise it is
+    # treated as a namespace key.
+    #
+    # Therefore, member variables should be defined in the class,
+    # not just in the __init__() function.  See BasicNamespace for
+    # an example.
+
+    def __getitem__(self, key):
+        try:
+            return self._getitem(key)
+        except KeyError:
+            return Undefined(key, self)
+
+    def __getattr__(self, name):
+        try:
+            return self._getitem(name)
+        except KeyError:
+            if name.startswith('__') and name.endswith('__'):
+                raise AttributeError
+            return Undefined(name, self)
+
+    def __setattr__(self, name, value):
+        try:
+            object.__getattribute__(self, name)
+            object.__setattr__(self, name, value)
+        except AttributeError:
+            self.__setitem__(name, value)
+
+    def __delattr__(self, name):
+        try:
+            object.__getattribute__(self, name)
+            object.__delattr__(self, name)
+        except AttributeError:
+            self.__delitem__(name)
+
+    # During unpickling, Python checks if the class has a __setstate__
+    # method.  But, the data dicts have not been initialised yet, which
+    # leads to  _getitem and hence __getattr__ raising an exception.  So
+    # we explicitly impement default __setstate__ behavior.
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+
+class Undefined(object):
+    """Helper class used to hold undefined names until assignment.
+
+    This class helps create any undefined subsections when an
+    assignment is made to a nested value.  For example, if the
+    statement is "cfg.a.b.c = 42", but "cfg.a.b" does not exist yet.
+    """
+
+    def __init__(self, name, namespace):
+        object.__setattr__(self, 'name', name)
+        object.__setattr__(self, 'namespace', namespace)
+
+    def __setattr__(self, name, value):
+        obj = self.namespace._new_namespace(self.name)
+        obj[name] = value
+
+    def __setitem__(self, name, value):
+        obj = self.namespace._new_namespace(self.name)
+        obj[name] = value
+
+
+# ---- Basic implementation of a ConfigNamespace
+
+class BasicConfig(ConfigNamespace):
+    """Represents a hierarchical collection of named values.
+
+    Values are added using dotted notation:
+
+    >>> n = BasicConfig()
+    >>> n.x = 7
+    >>> n.name.first = 'paramjit'
+    >>> n.name.last = 'oberoi'
+
+    ...and accessed the same way, or with [...]:
+
+    >>> n.x
+    7
+    >>> n.name.first
+    'paramjit'
+    >>> n.name.last
+    'oberoi'
+    >>> n['x']
+    7
+    >>> n['name']['first']
+    'paramjit'
+
+    Iterating over the namespace object returns the keys:
+
+    >>> l = list(n)
+    >>> l.sort()
+    >>> l
+    ['name', 'x']
+
+    Values can be deleted using 'del' and printed using 'print'.
+
+    >>> n.aaa = 42
+    >>> del n.x
+    >>> print(n)
+    aaa = 42
+    name.first = paramjit
+    name.last = oberoi
+
+    Nested namepsaces are also namespaces:
+
+    >>> isinstance(n.name, ConfigNamespace)
+    True
+    >>> print(n.name)
+    first = paramjit
+    last = oberoi
+    >>> sorted(list(n.name))
+    ['first', 'last']
+
+    Finally, values can be read from a file as follows:
+
+    >>> from six import StringIO
+    >>> sio = StringIO('''
+    ... # comment
+    ... ui.height = 100
+    ... ui.width = 150
+    ... complexity = medium
+    ... have_python
+    ... data.secret.password = goodness=gracious me
+    ... ''')
+    >>> n = BasicConfig()
+    >>> n._readfp(sio)
+    >>> print(n)
+    complexity = medium
+    data.secret.password = goodness=gracious me
+    have_python
+    ui.height = 100
+    ui.width = 150
+    """
+
+    # this makes sure that __setattr__ knows this is not a namespace key
+    _data = None
+
+    def __init__(self):
+        self._data = {}
+
+    def _getitem(self, key):
+        return self._data[key]
+
+    def __setitem__(self, key, value):
+        self._data[key] = value
+
+    def __delitem__(self, key):
+        del self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __str__(self, prefix=''):
+        lines = []
+        keys = list(self._data.keys())
+        keys.sort()
+        for name in keys:
+            value = self._data[name]
+            if isinstance(value, ConfigNamespace):
+                lines.append(value.__str__(prefix='%s%s.' % (prefix, name)))
+            else:
+                if value is None:
+                    lines.append('%s%s' % (prefix, name))
+                else:
+                    lines.append('%s%s = %s' % (prefix, name, value))
+        return '\n'.join(lines)
+
+    def _new_namespace(self, name):
+        obj = BasicConfig()
+        self._data[name] = obj
+        return obj
+
+    def _readfp(self, fp):
+        while True:
+            line = fp.readline()
+            if not line:
+                break
+
+            line = line.strip()
+            if not line:
+                continue
+            if line[0] == '#':
+                continue
+            data = line.split('=', 1)
+            if len(data) == 1:
+                name = line
+                value = None
+            else:
+                name = data[0].strip()
+                value = data[1].strip()
+            name_components = name.split('.')
+            ns = self
+            for n in name_components[:-1]:
+                if n in ns:
+                    ns = ns[n]
+                    if not isinstance(ns, ConfigNamespace):
+                        raise TypeError('value-namespace conflict', n)
+                else:
+                    ns = ns._new_namespace(n)
+            ns[name_components[-1]] = value
+
+
+# ---- Utility functions
+
+def update_config(target, source):
+    """Imports values from source into target.
+
+    Recursively walks the <source> ConfigNamespace and inserts values
+    into the <target> ConfigNamespace.  For example:
+
+    >>> n = BasicConfig()
+    >>> n.playlist.expand_playlist = True
+    >>> n.ui.display_clock = True
+    >>> n.ui.display_qlength = True
+    >>> n.ui.width = 150
+    >>> print(n)
+    playlist.expand_playlist = True
+    ui.display_clock = True
+    ui.display_qlength = True
+    ui.width = 150
+
+    >>> from iniparse import ini
+    >>> i = ini.INIConfig()
+    >>> update_config(i, n)
+    >>> print(i)
+    [playlist]
+    expand_playlist = True
+    <BLANKLINE>
+    [ui]
+    display_clock = True
+    display_qlength = True
+    width = 150
+
+    """
+    for name in sorted(source):
+        value = source[name]
+        if isinstance(value, ConfigNamespace):
+            if name in target:
+                myns = target[name]
+                if not isinstance(myns, ConfigNamespace):
+                    raise TypeError('value-namespace conflict')
+            else:
+                myns = target._new_namespace(name)
+            update_config(myns, value)
+        else:
+            target[name] = value
+
+
+class LineType(object):
+    line = None
+
+    def __init__(self, line=None):
+        if line is not None:
+            self.line = line.strip('\n')
+
+    # Return the original line for unmodified objects
+    # Otherwise construct using the current attribute values
+    def __str__(self):
+        if self.line is not None:
+            return self.line
+        else:
+            return self.to_string()
+
+    # If an attribute is modified after initialization
+    # set line to None since it is no longer accurate.
+    def __setattr__(self, name, value):
+        if hasattr(self, name):
+            self.__dict__['line'] = None
+        self.__dict__[name] = value
+
+    def to_string(self):
+        raise Exception('This method must be overridden in derived classes')
+
+
+class SectionLine(LineType):
+    regex = re.compile(r'^\['
+                       r'(?P<name>[^]]+)'
+                       r'\]\s*'
+                       r'((?P<csep>;|#)(?P<comment>.*))?$')
+
+    def __init__(self, name, comment=None, comment_separator=None,
+                 comment_offset=-1, line=None):
+        super(SectionLine, self).__init__(line)
+        self.name = name
+        self.comment = comment
+        self.comment_separator = comment_separator
+        self.comment_offset = comment_offset
+
+    def to_string(self):
+        out = '[' + self.name + ']'
+        if self.comment is not None:
+            # try to preserve indentation of comments
+            out = (out + ' ').ljust(self.comment_offset)
+            out = out + self.comment_separator + self.comment
+        return out
+
+    def parse(cls, line):
+        m = cls.regex.match(line.rstrip())
+        if m is None:
+            return None
+        return cls(m.group('name'), m.group('comment'),
+                   m.group('csep'), m.start('csep'),
+                   line)
+    parse = classmethod(parse)
+
+
+class OptionLine(LineType):
+    def __init__(self, name, value, separator=' = ', comment=None,
+                 comment_separator=None, comment_offset=-1, line=None):
+        super(OptionLine, self).__init__(line)
+        self.name = name
+        self.value = value
+        self.separator = separator
+        self.comment = comment
+        self.comment_separator = comment_separator
+        self.comment_offset = comment_offset
+
+    def to_string(self):
+        out = '%s%s%s' % (self.name, self.separator, self.value)
+        if self.comment is not None:
+            # try to preserve indentation of comments
+            out = (out + ' ').ljust(self.comment_offset)
+            out = out + self.comment_separator + self.comment
+        return out
+
+    regex = re.compile(r'^(?P<name>[^:=\s[][^:=]*)'
+                       r'(?P<sep>[:=]\s*)'
+                       r'(?P<value>.*)$')
+
+    def parse(cls, line):
+        m = cls.regex.match(line.rstrip())
+        if m is None:
+            return None
+
+        name = m.group('name').rstrip()
+        value = m.group('value')
+        sep = m.group('name')[len(name):] + m.group('sep')
+
+        # comments are not detected in the regex because
+        # ensuring total compatibility with ConfigParser
+        # requires that:
+        #     option = value    ;comment   // value=='value'
+        #     option = value;1  ;comment   // value=='value;1  ;comment'
+        #
+        # Doing this in a regex would be complicated.  I
+        # think this is a bug.  The whole issue of how to
+        # include ';' in the value needs to be addressed.
+        # Also, '#' doesn't mark comments in options...
+
+        coff = value.find(';')
+        if coff != -1 and value[coff - 1].isspace():
+            comment = value[coff + 1:]
+            csep = value[coff]
+            value = value[:coff].rstrip()
+            coff = m.start('value') + coff
+        else:
+            comment = None
+            csep = None
+            coff = -1
+
+        return cls(name, value, sep, comment, csep, coff, line)
+    parse = classmethod(parse)
+
+
+def change_comment_syntax(comment_chars='%;#', allow_rem=False):
+    comment_chars = re.sub(r'([\]\-\^])', r'\\\1', comment_chars)
+    regex = r'^(?P<csep>[%s]' % comment_chars
+    if allow_rem:
+        regex += '|[rR][eE][mM]'
+    regex += r')(?P<comment>.*)$'
+    CommentLine.regex = re.compile(regex)
+
+
+class CommentLine(LineType):
+    regex = re.compile(r'^(?P<csep>[;#]|[rR][eE][mM])'
+                       r'(?P<comment>.*)$')
+
+    def __init__(self, comment='', separator='#', line=None):
+        super(CommentLine, self).__init__(line)
+        self.comment = comment
+        self.separator = separator
+
+    def to_string(self):
+        return self.separator + self.comment
+
+    def parse(cls, line):
+        m = cls.regex.match(line.rstrip())
+        if m is None:
+            return None
+        return cls(m.group('comment'), m.group('csep'), line)
+    parse = classmethod(parse)
+
+
+class EmptyLine(LineType):
+    # could make this a singleton
+    def to_string(self):
+        return ''
+
+    value = property(lambda _: '')
+
+    def parse(cls, line):
+        if line.strip():
+            return None
+        return cls(line)
+    parse = classmethod(parse)
+
+
+class ContinuationLine(LineType):
+    regex = re.compile(r'^\s+(?P<value>.*)$')
+
+    def __init__(self, value, value_offset=None, line=None):
+        super(ContinuationLine, self).__init__(line)
+        self.value = value
+        if value_offset is None:
+            value_offset = 8
+        self.value_offset = value_offset
+
+    def to_string(self):
+        return ' ' * self.value_offset + self.value
+
+    def parse(cls, line):
+        m = cls.regex.match(line.rstrip())
+        if m is None:
+            return None
+        return cls(m.group('value'), m.start('value'), line)
+    parse = classmethod(parse)
+
+
+class LineContainer(object):
+    def __init__(self, d=None):
+        self.contents = []
+        self.orgvalue = None
+        if d:
+            if isinstance(d, list):
+                self.extend(d)
+            else:
+                self.add(d)
+
+    def add(self, x):
+        self.contents.append(x)
+
+    def extend(self, x):
+        for i in x:
+            self.add(i)
+
+    def get_name(self):
+        return self.contents[0].name
+
+    def set_name(self, data):
+        self.contents[0].name = data
+
+    def get_value(self):
+        if self.orgvalue is not None:
+            return self.orgvalue
+        elif len(self.contents) == 1:
+            return self.contents[0].value
+        else:
+            return '\n'.join([('%s' % x.value) for x in self.contents
+                              if not isinstance(x, CommentLine)])
+
+    def set_value(self, data):
+        self.orgvalue = data
+        lines = ('%s' % data).split('\n')
+
+        # If there is an existing ContinuationLine, use its offset
+        value_offset = None
+        for v in self.contents:
+            if isinstance(v, ContinuationLine):
+                value_offset = v.value_offset
+                break
+
+        # Rebuild contents list, preserving initial OptionLine
+        self.contents = self.contents[0:1]
+        self.contents[0].value = lines[0]
+        del lines[0]
+        for line in lines:
+            if line.strip():
+                self.add(ContinuationLine(line, value_offset))
+            else:
+                self.add(EmptyLine())
+
+    name = property(get_name, set_name)
+    value = property(get_value, set_value)
+
+    def __str__(self):
+        for c in self.contents:
+            pass  # print(c.__str__())
+        s = [x.__str__() for x in self.contents]
+        return '\n'.join(s)
+
+    def finditer(self, key):
+        for x in self.contents[::-1]:
+            if hasattr(x, 'name') and x.name == key:
+                yield x
+
+    def find(self, key):
+        for x in self.finditer(key):
+            return x
+        raise KeyError(key)
+
+
+def _make_xform_property(myattrname, srcattrname=None):
+    private_attrname = myattrname + 'value'
+    private_srcname = myattrname + 'source'
+    if srcattrname is None:
+        srcattrname = myattrname
+
+    def getfn(self):
+        srcobj = getattr(self, private_srcname)
+        if srcobj is not None:
+            return getattr(srcobj, srcattrname)
+        else:
+            return getattr(self, private_attrname)
+
+    def setfn(self, value):
+        srcobj = getattr(self, private_srcname)
+        if srcobj is not None:
+            setattr(srcobj, srcattrname, value)
+        else:
+            setattr(self, private_attrname, value)
+
+    return property(getfn, setfn)
+
+
+class INISection(ConfigNamespace):
+    _lines = None
+    _options = None
+    _defaults = None
+    _optionxformvalue = None
+    _optionxformsource = None
+    _compat_skip_empty_lines = set()
+
+    def __init__(self, lineobj, defaults=None,
+                 optionxformvalue=None, optionxformsource=None):
+        self._lines = [lineobj]
+        self._defaults = defaults
+        self._optionxformvalue = optionxformvalue
+        self._optionxformsource = optionxformsource
+        self._options = {}
+
+    _optionxform = _make_xform_property('_optionxform')
+
+    def _compat_get(self, key):
+        # identical to __getitem__ except that _compat_XXX
+        # is checked for backward-compatible handling
+        if key == '__name__':
+            return self._lines[-1].name
+        if self._optionxform:
+            key = self._optionxform(key)
+        try:
+            value = self._options[key].value
+            del_empty = key in self._compat_skip_empty_lines
+        except KeyError:
+            if self._defaults and key in self._defaults._options:
+                value = self._defaults._options[key].value
+                del_empty = key in self._defaults._compat_skip_empty_lines
+            else:
+                raise
+        if del_empty:
+            value = re.sub('\n+', '\n', value)
+        return value
+
+    def _getitem(self, key):
+        if key == '__name__':
+            return self._lines[-1].name
+        if self._optionxform:
+            key = self._optionxform(key)
+        try:
+            return self._options[key].value
+        except KeyError:
+            if self._defaults and key in self._defaults._options:
+                return self._defaults._options[key].value
+            else:
+                raise
+
+    def __setitem__(self, key, value):
+        if self._optionxform:
+            xkey = self._optionxform(key)
+        else:
+            xkey = key
+        if xkey in self._compat_skip_empty_lines:
+            self._compat_skip_empty_lines.remove(xkey)
+        if xkey not in self._options:
+            # create a dummy object - value may have multiple lines
+            obj = LineContainer(OptionLine(key, ''))
+            self._lines[-1].add(obj)
+            self._options[xkey] = obj
+        # the set_value() function in LineContainer
+        # automatically handles multi-line values
+        self._options[xkey].value = value
+
+    def __delitem__(self, key):
+        if self._optionxform:
+            key = self._optionxform(key)
+        if key in self._compat_skip_empty_lines:
+            self._compat_skip_empty_lines.remove(key)
+        for l in self._lines:
+            remaining = []
+            for o in l.contents:
+                if isinstance(o, LineContainer):
+                    n = o.name
+                    if self._optionxform:
+                        n = self._optionxform(n)
+                    if key != n:
+                        remaining.append(o)
+                else:
+                    remaining.append(o)
+            l.contents = remaining
+        del self._options[key]
+
+    def __iter__(self):
+        d = set()
+        for l in self._lines:
+            for x in l.contents:
+                if isinstance(x, LineContainer):
+                    if self._optionxform:
+                        ans = self._optionxform(x.name)
+                    else:
+                        ans = x.name
+                    if ans not in d:
+                        yield ans
+                        d.add(ans)
+        if self._defaults:
+            for x in self._defaults:
+                if x not in d:
+                    yield x
+                    d.add(x)
+
+    def _new_namespace(self, name):
+        raise Exception('No sub-sections allowed', name)
+
+
+def make_comment(line):
+    return CommentLine(line.rstrip('\n'))
+
+
+def readline_iterator(f):
+    """iterate over a file by only using the file object's readline method"""
+
+    have_newline = False
+    while True:
+        line = f.readline()
+
+        if not line:
+            if have_newline:
+                yield ""
+            return
+
+        if line.endswith('\n'):
+            have_newline = True
+        else:
+            have_newline = False
+
+        yield line
+
+
+def lower(x):
+    return x.lower()
+
+
+class INIConfig(ConfigNamespace):
+    _data = None
+    _sections = None
+    _defaults = None
+    _optionxformvalue = None
+    _optionxformsource = None
+    _sectionxformvalue = None
+    _sectionxformsource = None
+    _parse_exc = None
+    _bom = False
+
+    def __init__(self, fp=None, defaults=None, parse_exc=True,
+                 optionxformvalue=lower, optionxformsource=None,
+                 sectionxformvalue=None, sectionxformsource=None):
+        self._data = LineContainer()
+        self._parse_exc = parse_exc
+        self._optionxformvalue = optionxformvalue
+        self._optionxformsource = optionxformsource
+        self._sectionxformvalue = sectionxformvalue
+        self._sectionxformsource = sectionxformsource
+        self._sections = {}
+        if defaults is None:
+            defaults = {}
+        self._defaults = INISection(LineContainer(), optionxformsource=self)
+        for name, value in defaults.items():
+            self._defaults[name] = value
+        if fp is not None:
+            self._readfp(fp)
+
+    _optionxform = _make_xform_property('_optionxform', 'optionxform')
+    _sectionxform = _make_xform_property('_sectionxform', 'optionxform')
+
+    def _getitem(self, key):
+        if key == DEFAULTSECT:
+            return self._defaults
+        if self._sectionxform:
+            key = self._sectionxform(key)
+        return self._sections[key]
+
+    def __setitem__(self, key, value):
+        raise Exception('Values must be inside sections', key, value)
+
+    def __delitem__(self, key):
+        if self._sectionxform:
+            key = self._sectionxform(key)
+        for line in self._sections[key]._lines:
+            self._data.contents.remove(line)
+        del self._sections[key]
+
+    def __iter__(self):
+        d = set()
+        d.add(DEFAULTSECT)
+        for x in self._data.contents:
+            if isinstance(x, LineContainer):
+                if x.name not in d:
+                    yield x.name
+                    d.add(x.name)
+
+    def _new_namespace(self, name):
+        if self._data.contents:
+            self._data.add(EmptyLine())
+        obj = LineContainer(SectionLine(name))
+        self._data.add(obj)
+        if self._sectionxform:
+            name = self._sectionxform(name)
+        if name in self._sections:
+            ns = self._sections[name]
+            ns._lines.append(obj)
+        else:
+            ns = INISection(obj, defaults=self._defaults,
+                            optionxformsource=self)
+            self._sections[name] = ns
+        return ns
+
+    def __str__(self):
+        if self._bom:
+            fmt = u'\ufeff%s'
+        else:
+            fmt = '%s'
+        return fmt % self._data.__str__()
+
+    __unicode__ = __str__
+
+    _line_types = [EmptyLine, CommentLine,
+                   SectionLine, OptionLine,
+                   ContinuationLine]
+
+    def _parse(self, line):
+        for linetype in self._line_types:
+            lineobj = linetype.parse(line)
+            if lineobj:
+                return lineobj
+        else:
+            # can't parse line
+            return None
+
+    def _readfp(self, fp):
+        cur_section = None
+        cur_option = None
+        cur_section_name = None
+        cur_option_name = None
+        pending_lines = []
+        pending_empty_lines = False
+        try:
+            fname = fp.name
+        except AttributeError:
+            fname = '<???>'
+        linecount = 0
+        exc = None
+        line = None
+
+        for line in readline_iterator(fp):
+            # Check for BOM on first line
+            if linecount == 0 and isinstance(line, str):
+                if line[0] == u'\ufeff':
+                    line = line[1:]
+                    self._bom = True
+
+            lineobj = self._parse(line)
+            linecount += 1
+
+            if (not cur_section and
+                not isinstance(lineobj,
+                               (CommentLine, EmptyLine, SectionLine))):
+                if self._parse_exc:
+                    raise MissingSectionHeaderError(fname, linecount, line)
+                else:
+                    lineobj = make_comment(line)
+
+            if lineobj is None:
+                if self._parse_exc:
+                    if exc is None:
+                        exc = ParsingError(fname)
+                    exc.append(linecount, line)
+                lineobj = make_comment(line)
+
+            if isinstance(lineobj, ContinuationLine):
+                if cur_option:
+                    if pending_lines:
+                        cur_option.extend(pending_lines)
+                        pending_lines = []
+                        if pending_empty_lines:
+                            optobj._compat_skip_empty_lines.add(cur_option_name)
+                            pending_empty_lines = False
+                    cur_option.add(lineobj)
+                else:
+                    # illegal continuation line - convert to comment
+                    if self._parse_exc:
+                        if exc is None:
+                            exc = ParsingError(fname)
+                        exc.append(linecount, line)
+                    lineobj = make_comment(line)
+
+            if isinstance(lineobj, OptionLine):
+                if pending_lines:
+                    cur_section.extend(pending_lines)
+                    pending_lines = []
+                    pending_empty_lines = False
+                cur_option = LineContainer(lineobj)
+                cur_section.add(cur_option)
+                if self._optionxform:
+                    cur_option_name = self._optionxform(cur_option.name)
+                else:
+                    cur_option_name = cur_option.name
+                if cur_section_name == DEFAULTSECT:
+                    optobj = self._defaults
+                else:
+                    optobj = self._sections[cur_section_name]
+                optobj._options[cur_option_name] = cur_option
+
+            if isinstance(lineobj, SectionLine):
+                self._data.extend(pending_lines)
+                pending_lines = []
+                pending_empty_lines = False
+                cur_section = LineContainer(lineobj)
+                self._data.add(cur_section)
+                cur_option = None
+                cur_option_name = None
+                if cur_section.name == DEFAULTSECT:
+                    self._defaults._lines.append(cur_section)
+                    cur_section_name = DEFAULTSECT
+                else:
+                    if self._sectionxform:
+                        cur_section_name = self._sectionxform(cur_section.name)
+                    else:
+                        cur_section_name = cur_section.name
+                    if cur_section_name not in self._sections:
+                        self._sections[cur_section_name] = INISection(
+                            cur_section, defaults=self._defaults,
+                            optionxformsource=self
+                        )
+                    else:
+                        self._sections[cur_section_name]._lines.append(cur_section)
+
+            if isinstance(lineobj, (CommentLine, EmptyLine)):
+                pending_lines.append(lineobj)
+                if isinstance(lineobj, EmptyLine):
+                    pending_empty_lines = True
+
+        self._data.extend(pending_lines)
+        if line and line[-1] == '\n':
+            self._data.add(EmptyLine())
+
+        if exc:
+            raise exc
+
+
+def tidy(cfg):
+    """Clean up blank lines.
+
+    This functions makes the configuration look clean and
+    handwritten - consecutive empty lines and empty lines at
+    the start of the file are removed, and one is guaranteed
+    to be at the end of the file.
+    """
+
+    if isinstance(cfg, RawConfigParser):
+        cfg = cfg.data
+    cont = cfg._data.contents
+    i = 1
+    while i < len(cont):
+        if isinstance(cont[i], LineContainer):
+            tidy_section(cont[i])
+            i += 1
+        elif (isinstance(cont[i - 1], EmptyLine) and
+              isinstance(cont[i], EmptyLine)):
+            del cont[i]
+        else:
+            i += 1
+
+    # Remove empty first line
+    if cont and isinstance(cont[0], EmptyLine):
+        del cont[0]
+
+    # Ensure a last line
+    if cont and not isinstance(cont[-1], EmptyLine):
+        cont.append(EmptyLine())
+
+
+def tidy_section(lc):
+    cont = lc.contents
+    i = 1
+    while i < len(cont):
+        if (
+            isinstance(cont[i - 1], EmptyLine) and
+            isinstance(cont[i], EmptyLine)
+        ):
+            del cont[i]
+        else:
+            i += 1
+
+    # Remove empty first line
+    if len(cont) > 1 and isinstance(cont[1], EmptyLine):
+        del cont[1]
+
+
+# TODO: support configurable options for various ini variants.
+# For now just support parameters without '=' specified
+class CrudiniInputFilter(object):
+    def __init__(self, fp):
+        self.fp = fp
+        self.crudini_no_arg = False
+
+    def readline(self):
+        line = self.fp.readline()
+        # XXX: This doesn't handle ;inline comments.
+        # Really should be done within inparse.
+        if (
+            line and line[0] not in '[ \t#;\n' and
+            '=' not in line and ':' not in line
+        ):
+            self.crudini_no_arg = True
+            line = line[:-1] + ' = crudini_no_arg\n'
+        return line
+
+
+# XXX: should be done in iniparse.  Used to
+# add support for ini files without a section
+class AddDefaultSection(CrudiniInputFilter):
+    def __init__(self, fp):
+        CrudiniInputFilter.__init__(self, fp)
+        self.first = True
+
+    def readline(self):
+        if self.first:
+            self.first = False
+            return '[%s]' % DEFAULTSECT
+        else:
+            return CrudiniInputFilter.readline(self)
+
+
+class FileLock(object):
+    """Advisory file based locking.  This should be reasonably cross platform
+       and also work over distributed file systems."""
+
+    def __init__(self, exclusive=False):
+        # In inplace mode, the process must be careful to not close this fp
+        # until finished, nor open and close another fp associated with the
+        # file.
+        self.fp = None
+        self.locked = False
+
+        if os.name == 'nt':
+            import msvcrt
+
+            def lock(self):
+                msvcrt.locking(self.fp, msvcrt.LK_LOCK, 1)
+                self.locked = True
+
+            def unlock(self):
+                if self.locked:
+                    msvcrt.locking(self.fp, msvcrt.LK_UNLCK, 1)
+                self.locked = False
+
+        else:
+            import fcntl
+
+            def lock(self):
+                operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+                fcntl.lockf(self.fp, operation)
+                self.locked = True
+
+            def unlock(self):
+                if self.locked:
+                    fcntl.lockf(self.fp, fcntl.LOCK_UN)
+                self.locked = False
+
+        FileLock.lock = lock
+        FileLock.unlock = unlock
+
+
+class LockedFile(FileLock):
+    """Open a file with advisory locking.  This provides the Isolation
+       property of ACID, to avoid missing writes.  In addition this provides AC
+       properties of ACID if crudini is the only logic accessing the ini file.
+       This should work on most platforms and distributed file systems.
+
+       Caveats in --inplace mode:
+        - File must be writeable
+        - File should be generally non readable to avoid read lock DoS.
+       Caveats in replace mode:
+        - Less responsive when there is contention."""
+
+    def __init__(self, filename, operation, inplace, create):
+
+        self.fp_cmp = None
+        self.filename = filename
+        self.operation = operation
+
+        FileLock.__init__(self, operation != "--get")
+
+        atexit.register(self.delete)
+
+        open_mode = os.O_RDONLY
+        if operation != "--get":
+            # We're only reading here, but we check now for write
+            # permissions we'll need in --inplace case to avoid
+            # redundant processing.
+            # Also an exlusive lock needs write perms anyway.
+            open_mode = os.O_RDWR
+
+            if create and operation != '--del':
+                open_mode += os.O_CREAT
+
+        try:
+            self.fp = os.fdopen(os.open(self.filename, open_mode, 0o666))
+            if inplace:
+                # In general readers (--get) are protected by file_replace(),
+                # but using read lock here gives AC of the ACID properties
+                # when only accessing the file through crudini even with
+                # file_rewrite().
+                self.lock()
+            else:
+                # The file may have been renamed since the open so recheck
+                while True:
+                    self.lock()
+                    fpnew = os.fdopen(os.open(self.filename, open_mode, 0o666))
+                    if os.path.sameopenfile(self.fp.fileno(), fpnew.fileno()):
+                        # Note we don't fpnew.close() here as that would break
+                        # any existing fcntl lock (fcntl.lockf is an fcntl lock
+                        # despite the name).  We don't use flock() at present
+                        # as that's less consistent across platforms and may
+                        # be an fcntl lock on NFS anyway for example.
+                        self.fp_cmp = fpnew
+                        break
+                    else:
+                        self.fp.close()
+                        self.fp = fpnew
+        except EnvironmentError as e:
+            # Treat --del on a non existing file as operating on NULL data
+            # which will be deemed unchanged, and thus not re{written,created}
+            # We don't exit early here so that --verbose is also handled.
+            if create and operation == '--del' \
+               and e.errno in (errno.ENOTDIR, errno.ENOENT):
+                self.fp = StringIO('')
+            else:
+                error(str(e))
+                sys.exit(1)
+
+    def delete(self):
+        # explicit close so closed in correct order if taking lock multiple
+        # times, and also explicit "delete" needed to avoid implicit __del__
+        # after os module is unloaded.
+        self.unlock()
+        if self.fp:
+            self.fp.close()
+        if self.fp_cmp:
+            self.fp_cmp.close()
+
+
+# Note we use RawConfigParser rather than SafeConfigParser
+# to avoid unwanted variable interpolation.
+# Note iniparse doesn't currently support allow_no_value=True.
+class CrudiniConfigParser(RawConfigParser):
+    def __init__(self, preserve_case=False):
+        RawConfigParser.__init__(self)
+        # Without the following we can't have params starting with "rem"!
+        # We ignore lines starting with '%' which mercurial uses to include
+        change_comment_syntax('%;#', allow_rem=False)
+        if preserve_case:
+            self.optionxform = str
+
+
+class Print(object):
+    """Use for default output format."""
+
+    def section_header(self, section):
+        """Print section header.
+
+        :param section: str
+        """
+
+        print(section)
+
+    def name_value(self, name, value, section=None):
+        """Print parameter.
+
+        :param name: str
+        :param value: str
+        :param section: str (default 'None')
+        """
+
+        if value == 'crudini_no_arg':
+            value = ''
+        print(name or value)
+
+
+class PrintIni(Print):
+    """Use for ini output format."""
+
+    def section_header(self, section):
+        print("[%s]" % section)
+
+    def name_value(self, name, value, section=None):
+        if value == 'crudini_no_arg':
+            value = ''
+        print("%s %s %s" % (name, '=', value.replace('\n', '\n '), ))
+
+
+class PrintLines(Print):
+    """Use for lines output format."""
+
+    def name_value(self, name, value, section=None):
+        # Both unambiguous and easily parseable by shell. Caveat is
+        # that sections and values with spaces are awkward to split in shell
+        if section:
+            line = '[ %s ]' % section
+            if name:
+                line += ' '
+        if name:
+            line += '%s' % name
+        if value == 'crudini_no_arg':
+            value = ''
+        if value:
+            line += ' = %s' % value.replace('\n', '\\n')
+        print(line)
+
+
+class PrintSh(Print):
+    """Use for shell output format."""
+
+    @staticmethod
+    def _valid_sh_identifier(
+        i,
+        safe_chars=frozenset(string.ascii_letters + string.digits + '_')
+    ):
+        """Provide validation of the output identifiers as it's dangerous to
+        leave validation to shell. Consider for example doing eval on this in
+        shell: rm -Rf /;oops=val
+
+        :param i: str
+        :param sh_safe_id_chars: frozenset
+        :return: bool
+        """
+
+        if i[0] in string.digits:
+            return False
+        for c in i:
+            if c not in safe_chars:
+                return False
+        return True
+
+    def name_value(self, name, value, section=None):
+        if not PrintSh._valid_sh_identifier(name):
+            error('Invalid sh identifier: %s' % name)
+            sys.exit(1)
+        if value == 'crudini_no_arg':
+            value = ''
+        sys.stdout.write("%s=%s\n" % (name, pipes.quote(value)))
+
+
+class Crudini(object):
+    mode = fmt = update = inplace = cfgfile = output = section = param = \
+        value = vlist = listsep = verbose = None
+
+    locked_file = None
+    section_explicit_default = False
+    data = None
+    conf = None
+    added_default_section = False
+    _print = None
+
+    # The following exits cleanly on Ctrl-C,
+    # while treating other exceptions as before.
+    @staticmethod
+    def cli_exception(type, value, tb):
+        if not issubclass(type, KeyboardInterrupt):
+            sys.__excepthook__(type, value, tb)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def remove_file_on_error(path):
+        """Protect code that wants to operate on PATH atomically.
+        Any exception will cause PATH to be removed.
+        """
+        try:
+            yield
+        except Exception:
+            t, v, tb = sys.exc_info()
+            delete_if_exists(path)
+            raise t(v).with_traceback(tb)
+
+    @staticmethod
+    def file_replace(name, data):
+        """Replace file as atomically as possible,
+        fulfilling and AC properties of ACID.
+        This is essentially using method 9 from:
+        http://www.pixelbeat.org/docs/unix_file_replacement.html
+
+        Caveats:
+         - Changes ownership of the file being edited
+           by non root users (due to POSIX interface limitations).
+         - Loses any extended attributes of the original file
+           (due to the simplicity of this implementation).
+         - Existing hardlinks will be separated from the
+           newly replaced file.
+         - Ignores the write permissions of the original file.
+         - Requires write permission on the directory as well as the file.
+         - With python2 on windows we don't fulfil the A ACID property.
+
+        To avoid the above caveats see the --inplace option.
+        """
+        (f, tmp) = tempfile.mkstemp(".tmp", prefix=name + ".", dir=".")
+
+        with Crudini.remove_file_on_error(tmp):
+            shutil.copystat(name, tmp)
+
+            if hasattr(os, 'fchown') and os.geteuid() == 0:
+                st = os.stat(name)
+                os.fchown(f, st.st_uid, st.st_gid)
+
+            os.write(f, data.encode('utf-8'))
+            # We assume the existing file is persisted,
+            # so sync here to ensure new data is persisted
+            # before referencing it.  Otherwise the metadata could
+            # be written first, referencing the new data, which
+            # would be nothing if a crash occured before the
+            # data was allocated/persisted.
+            os.fsync(f)
+            os.close(f)
+
+            if hasattr(os, 'replace'):  # >= python 3.3
+                os.replace(tmp, name)  # atomic even on windos
+            elif os.name == 'posix':
+                os.rename(tmp, name)  # atomic on POSIX
+            else:
+                backup = tmp + '.backup'
+                os.rename(name, backup)
+                os.rename(tmp, name)
+                delete_if_exists(backup)
+
+            # Sync out the new directory entry to provide
+            # better durability that the new inode is referenced
+            # rather than continuing to reference the old inode.
+            # This also provides verification in exit status that
+            # this update completes.
+            O_DIRECTORY = os.O_DIRECTORY if hasattr(os, 'O_DIRECTORY') else 0
+            dirfd = os.open(os.path.dirname(name) or '.', O_DIRECTORY)
+            os.fsync(dirfd)
+            os.close(dirfd)
+
+    @staticmethod
+    def file_rewrite(name, data):
+        """Rewrite file inplace avoiding the caveats
+        noted in file_replace().
+
+        Caveats:
+         - Not Atomic as readers may see incomplete data for a while.
+         - Not Consistent as multiple writers may overlap.
+         - Less Durable as existing data truncated before I/O completes.
+         - Requires write access to file rather than write access to dir.
+        """
+        with open(name, 'w') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+
+    # TODO item should be items and split also
+    # especially in merge mode
+    @staticmethod
+    def update_list(curr_val, item, mode, sep):
+        curr_items = []
+        use_space = True
+        if curr_val:
+            if sep is None:
+                use_space = ' ' in curr_val or ',' not in curr_val
+                curr_items = [v.strip() for v in curr_val.split(",")]
+            else:
+                curr_items = curr_val.split(sep)
+
+        if mode == "--set":
+            if item not in curr_items:
+                curr_items.append(item)
+        elif mode == "--del":
+            try:
+                curr_items.remove(item)
+            except ValueError:
+                pass
+
+        if sep is None:
+            sep = ","
+            if use_space:
+                sep += " "
+
+        return sep.join(curr_items)
+
+    def usage(self, exitval=0):
+        cmd = os.path.basename(sys.argv[0])
+        output = sys.stderr if exitval else sys.stdout
+        output.write("""\
+A utility for manipulating ini files
+
+Usage: %s --set [OPTION]...   config_file section   [param] [value]
+  or:  %s --get [OPTION]...   config_file [section] [param]
+  or:  %s --del [OPTION]...   config_file section   [param] [list value]
+  or:  %s --merge [OPTION]... config_file [section]
+
+Options:
+
+  --existing[=WHAT]  For --set, --del and --merge, fail if item is missing,
+                       where WHAT is 'file', 'section', or 'param', or if
+                       not specified; all specified items.
+  --format=FMT       For --get, select the output FMT.
+                       Formats are sh,ini,lines
+  --inplace          Lock and write files in place.
+                       This is not atomic but has less restrictions
+                       than the default replacement method.
+  --list             For --set and --del, update a list (set) of values
+  --list-sep=STR     Delimit list values with \"STR\" instead of \" ,\"
+  --output=FILE      Write output to FILE instead. '-' means stdout
+  --verbose          Indicate on stderr if changes were made
+  --help             Write this help to stdout
+  --version          Write version to stdout
+""" % (cmd, cmd, cmd, cmd)
+        )
+        sys.exit(exitval)
+
+    def parse_options(self):
+
+        # Handle optional arg to long option
+        # The gettopt module should really support this
+        for i, opt in enumerate(sys.argv):
+            if opt == '--existing':
+                sys.argv[i] = '--existing='
+            elif opt == '--':
+                break
+
+        try:
+            long_options = [
+                'del',
+                'existing=',
+                'format=',
+                'get',
+                'help',
+                'inplace',
+                'list',
+                'list-sep=',
+                'merge',
+                'output=',
+                'set',
+                'verbose',
+                'version'
+            ]
+            opts, args = getopt.getopt(sys.argv[1:], '', long_options)
+        except getopt.GetoptError as e:
+            error(str(e))
+            self.usage(1)
+
+        for o, a in opts:
+            if o in ('--help',):
+                self.usage(0)
+            elif o in ('--version',):
+                print('crudini 0.9')
+                sys.exit(0)
+            elif o in ('--verbose',):
+                self.verbose = True
+            elif o in ('--set', '--del', '--get', '--merge'):
+                if self.mode:
+                    error('One of --set|--del|--get|--merge can be specified')
+                    self.usage(1)
+                self.mode = o
+            elif o in ('--format',):
+                self.fmt = a
+                if self.fmt not in ('sh', 'ini', 'lines'):
+                    error('--format not recognized: %s' % self.fmt)
+                    self.usage(1)
+            elif o in ('--existing',):
+                self.update = a or 'param'  # 'param' implies all must exist
+                if self.update not in ('file', 'section', 'param'):
+                    error('--existing item not recognized: %s' % self.update)
+                    self.usage(1)
+            elif o in ('--inplace',):
+                self.inplace = True
+            elif o in ('--list',):
+                self.vlist = "set"  # TODO support combos of list, sorted, ...
+            elif o in ('--list-sep',):
+                self.listsep = a
+            elif o in ('--output',):
+                self.output = a
+
+        if not self.mode:
+            error('One of --set|--del|--get|--merge must be specified')
+            self.usage(1)
+
+        try:
+            self.cfgfile = args[0]
+            self.section = args[1]
+            self.param = args[2]
+            self.value = args[3]
+        except IndexError:
+            pass
+
+        if not self.output:
+            self.output = self.cfgfile
+
+        if self.cfgfile is None:
+            self.usage(1)
+        if self.section is None and self.mode in ('--del', '--set'):
+            self.usage(1)
+        if self.param is not None and self.mode in ('--merge',):
+            self.usage(1)
+        if self.value is not None and self.mode not in ('--set',):
+            if not (self.mode == '--del' and self.vlist):
+                error('A value should not be specified with %s' % self.mode)
+                self.usage(1)
+
+        if self.mode == '--merge' and self.fmt == 'sh':
+            # I'm not sure how useful is is to support this.
+            # printenv will already generate a mostly compat ini format.
+            # If you want to also include non exported vars (from `set`),
+            # then there is a format change.
+            error('sh format input is not supported at present')
+            sys.exit(1)
+
+        # Protect against generating non parseable ini files
+        if self.section and ('[' in self.section or ']' in self.section):
+            error("section names should not contain '[' or ']': %s" %
+                  self.section)
+            sys.exit(1)
+        if self.param and self.param.startswith('['):
+            error("param names should not start with '[': %s" % self.param)
+            sys.exit(1)
+
+        if self.fmt == 'lines':
+            self._print = PrintLines()
+        elif self.fmt == 'sh':
+            self._print = PrintSh()
+        elif self.fmt == 'ini':
+            self._print = PrintIni()
+        else:
+            self._print = Print()
+
+    def _has_default_section(self):
+        fp = StringIO(self.data)
+        for line in fp:
+            if line.startswith('[%s]' % DEFAULTSECT):
+                return True
+        return False
+
+    def _chksum(self, data):
+        h = hashlib.sha256()
+        h.update(data.encode('utf-8'))
+        return h.digest()
+
+    def _parse_file(self, filename, add_default=False, preserve_case=False):
+        try:
+            if self.data is None:
+                # Read all data up front as this is done by iniparse anyway
+                # Doing it here will avoid rereads on reparse and support
+                # correct parsing of stdin
+                if filename == '-':
+                    self.data = sys.stdin.read()
+                else:
+                    self.data = self.locked_file.fp.read()
+                if self.mode != '--get':
+                    # compare checksums to flag any changes
+                    # (even spacing or case adjustments) with --verbose,
+                    # and to avoid rewriting the file if not necessary
+                    self.chksum = self._chksum(self.data)
+
+                if self.data.startswith('\n'):
+                    self.newline_at_start = True
+                else:
+                    self.newline_at_start = False
+
+            fp = StringIO(self.data)
+            if add_default:
+                fp = AddDefaultSection(fp)
+            else:
+                fp = CrudiniInputFilter(fp)
+
+            conf = CrudiniConfigParser(preserve_case=preserve_case)
+            conf.readfp(fp)
+            self.crudini_no_arg = fp.crudini_no_arg
+            return conf
+        except EnvironmentError as e:
+            error(str(e))
+            sys.exit(1)
+
+    def parse_file(self, filename, preserve_case=False):
+        self.added_default_section = False
+        self.data = None
+
+        if filename != '-':
+            self.locked_file = LockedFile(filename, self.mode, self.inplace,
+                                          not self.update)
+
+        try:
+            conf = self._parse_file(filename, preserve_case=preserve_case)
+
+            if not conf.items(DEFAULTSECT):
+                # Check if there is just [DEFAULT] in a file with no
+                # name=values to avoid adding a duplicate section.
+                if not self._has_default_section():
+                    # reparse with inserted [DEFAULT] to be able to add global
+                    # opts etc.
+                    conf = self._parse_file(
+                        filename,
+                        add_default=True,
+                        preserve_case=preserve_case
+                    )
+                    self.added_default_section = True
+
+        except MissingSectionHeaderError:
+            conf = self._parse_file(
+                filename,
+                add_default=True,
+                preserve_case=preserve_case
+            )
+            self.added_default_section = True
+        except ParsingError as e:
+            error(str(e))
+            sys.exit(1)
+
+        self.data = None
+        return conf
+
+    def set_name_value(self, section, param, value):
+        curr_val = None
+
+        if self.update in ('param', 'section'):
+            if param is None:
+                if not (
+                    section == DEFAULTSECT or
+                    self.conf.has_section(section)
+                ):
+                    raise ConfigParser.NoSectionError(section)
+            else:
+                try:
+                    curr_val = self.conf.get(section, param)
+                except NoSectionError:
+                    if self.update == 'section':
+                        raise
+                except NoOptionError:
+                    if self.update == 'param':
+                        raise
+        elif (section != DEFAULTSECT and
+                not self.conf.has_section(section)):
+            if self.mode == "--del":
+                return
+            else:
+                # Note this always adds a '\n' before the section name
+                # resulting in double spaced sections or blank line at
+                # the start of a new file to which a new section is added.
+                # We handle the empty file case at least when writing.
+                self.conf.add_section(section)
+
+        if param is not None:
+            if self.update not in ('param', 'section'):
+                try:
+                    curr_val = self.conf.get(section, param)
+                except NoOptionError:
+                    if self.mode == "--del":
+                        return
+            if value is None:
+                value = 'crudini_no_arg' if self.crudini_no_arg else ''
+            if self.vlist:
+                value = self.update_list(
+                    curr_val,
+                    value,
+                    self.mode,
+                    self.listsep
+                )
+            self.conf.set(section, param, value)
+
+    def command_set(self):
+        """Insert a section/parameter."""
+
+        self.set_name_value(self.section, self.param, self.value)
+
+    def command_merge(self):
+        """Merge an ini file from another ini."""
+
+        for msection in [DEFAULTSECT] + self.mconf.sections():
+            if msection == DEFAULTSECT:
+                defaults_to_strip = {}
+            else:
+                defaults_to_strip = self.mconf.defaults()
+            items = self.mconf.items(msection)
+            set_param = False
+            for item in items:
+                # XXX: Note this doesn't update an item in section
+                # if matching value also in default (global) section.
+                if defaults_to_strip.get(item[0]) != item[1]:
+                    ignore_errs = (ConfigParser.NoOptionError,)
+                    if self.section is not None:
+                        msection = self.section
+                    elif self.update not in ('param', 'section'):
+                        ignore_errs += (ConfigParser.NoSectionError,)
+                    try:
+                        set_param = True
+                        self.set_name_value(msection, item[0], item[1])
+                    except ignore_errs:
+                        pass
+            # For empty sections ensure the section header is added
+            if not set_param and self.section is None:
+                self.set_name_value(msection, None, None)
+
+    def command_del(self):
+        """Delete a section/parameter."""
+
+        if self.param is None:
+            if self.section == DEFAULTSECT:
+                for name in self.conf.defaults():
+                    self.conf.remove_option(DEFAULTSECT, name)
+            else:
+                if not self.conf.remove_section(self.section) \
+                   and self.update in ('param', 'section'):
+                    raise ConfigParser.NoSectionError(self.section)
+        elif self.value is None:
+            try:
+                if not self.conf.remove_option(self.section, self.param) \
+                   and self.update == 'param':
+                    raise ConfigParser.NoOptionError(self.section, self.param)
+            except NoSectionError:
+                if self.update in ('param', 'section'):
+                    raise
+        else:  # remove item from list
+            self.set_name_value(self.section, self.param, self.value)
+
+    def command_get(self):
+        """Output a section/parameter"""
+
+        if self.fmt != 'lines':
+            if self.section is None:
+                if self.conf.defaults():
+                    self._print.section_header(DEFAULTSECT)
+                for item in self.conf.sections():
+                    self._print.section_header(item)
+            elif self.param is None:
+                if self.fmt == 'ini':
+                    self._print.section_header(self.section)
+                if self.section == DEFAULTSECT:
+                    defaults_to_strip = {}
+                else:
+                    defaults_to_strip = self.conf.defaults()
+                for item in self.conf.items(self.section):
+                    # XXX: Note this strips an item from section
+                    # if matching value also in default (global) section.
+                    if defaults_to_strip.get(item[0]) != item[1]:
+                        if self.fmt:
+                            val = item[1]
+                        else:
+                            val = None
+                        self._print.name_value(item[0], val)
+            else:
+                val = self.conf.get(self.section, self.param)
+                if self.fmt:
+                    name = self.param
+                else:
+                    name = None
+                self._print.name_value(name, val)
+        else:
+            if self.section is None:
+                sections = self.conf.sections()
+                if self.conf.defaults():
+                    sections.insert(0, DEFAULTSECT)
+            else:
+                sections = (self.section,)
+            if self.param is not None:
+                val = self.conf.get(self.section, self.param)
+                self._print.name_value(self.param, val, self.section)
+            else:
+                for section in sections:
+                    if section == DEFAULTSECT:
+                        defaults_to_strip = {}
+                    else:
+                        defaults_to_strip = self.conf.defaults()
+                    items = False
+                    for item in self.conf.items(section):
+                        # XXX: Note this strips an item from section
+                        # if matching value also in default (global) section.
+                        if defaults_to_strip.get(item[0]) != item[1]:
+                            val = item[1]
+                            self._print.name_value(item[0], val, section)
+                            items = True
+                    if not items:
+                        self._print.name_value(None, None, section)
+
+    def run(self):
+        if sys.stdin.isatty():
+            sys.excepthook = Crudini.cli_exception
+
+        self.parse_options()
+
+        self.section_explicit_default = False
+        if self.section == '':
+            self.section = DEFAULTSECT
+        elif self.section == DEFAULTSECT:
+            self.section_explicit_default = True
+
+        if self.mode == '--merge':
+            self.mconf = self.parse_file('-', preserve_case=True)
+
+        self.madded_default_section = self.added_default_section
+
+        try:
+            if self.mode == '--get' and self.param is None:
+                # Maintain case when outputting params.
+                # Note sections are handled case sensitively
+                # even if optionxform is not set.
+                preserve_case = True
+            else:
+                preserve_case = False
+            self.conf = self.parse_file(self.cfgfile,
+                                        preserve_case=preserve_case)
+
+            # Take the [DEFAULT] header from the input if present
+            if (
+                self.mode == '--merge' and
+                self.update not in ('param', 'section') and
+                not self.madded_default_section and
+                self.mconf.items(DEFAULTSECT)
+            ):
+                self.added_default_section = self.madded_default_section
+
+            if self.mode == '--set':
+                self.command_set()
+            elif self.mode == '--merge':
+                self.command_merge()
+            elif self.mode == '--del':
+                self.command_del()
+            elif self.mode == '--get':
+                self.command_get()
+
+            if self.mode != '--get':
+                # XXX: Ideally we should just do conf.write(f) here, but to
+                # avoid iniparse issues, we massage the data a little here
+                str_data = str(self.conf.data)
+                if len(str_data) and str_data[-1] != '\n':
+                    str_data += '\n'
+
+                if (
+                    (
+                        self.added_default_section and
+                        not (
+                            self.section_explicit_default and
+                            self.mode in ('--set', '--merge')
+                        )
+                    ) or
+                    (
+                        self.mode == '--del' and
+                        self.section == DEFAULTSECT and
+                        self.param is None
+                    )
+                ):
+                    # See note at add_section() call above detailing
+                    # where this extra \n comes from that we handle
+                    # here for the edge case of new files.
+                    default_sect = '[%s]\n' % DEFAULTSECT
+                    if not self.newline_at_start and \
+                       str_data.startswith(default_sect + '\n'):
+                        str_data = str_data[len(default_sect) + 1:]
+                    else:
+                        str_data = str_data.replace(default_sect, '', 1)
+
+                if self.crudini_no_arg:
+                    # This is the main case
+                    str_data = str_data.replace(' = crudini_no_arg', '')
+                    # Handle setting empty values for existing param= format
+                    str_data = str_data.replace('=crudini_no_arg', '=')
+                    # Handle setting empty values for existing colon: format
+                    str_data = str_data.replace(':crudini_no_arg', ':')
+
+                changed = self.chksum != self._chksum(str_data)
+
+                if self.output == '-':
+                    sys.stdout.write(str_data)
+                elif changed:
+                    if self.inplace:
+                        self.file_rewrite(self.output, str_data)
+                    else:
+                        self.file_replace(os.path.realpath(self.output),
+                                          str_data)
+
+                if self.verbose:
+                    def quote_val(val):
+                        return pipes.quote(val).replace('\n', '\\n')
+                    what = ' '.join(map(quote_val,
+                                        filter(bool,
+                                               [self.mode, self.cfgfile,
+                                                self.section, self.param,
+                                                self.value])))
+                    sys.stderr.write('%s: %s\n' %
+                                     (('unchanged', 'changed')[changed], what))
+
+            # Finish writing now to consistently handle errors here
+            # (and while excepthook is set)
+            sys.stdout.flush()
+        except ParsingError as e:
+            error('Error parsing %s: %s' % (self.cfgfile, " ".join(e.args)))
+            sys.exit(1)
+        except NoSectionError as e:
+            error('Section not found: %s' % e.section)
+            sys.exit(1)
+        except NoOptionError:
+            error('Parameter not found: %s' % self.param)
+            sys.exit(1)
+        except EnvironmentError as e:
+            # Handle EPIPE as python doesn't catch SIGPIPE
+            if e.errno != errno.EPIPE:
+                error(str(e))
+                sys.exit(1)
+
+
+def main():
+    crudini = Crudini()
+    return crudini.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
